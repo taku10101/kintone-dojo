@@ -676,11 +676,17 @@
       const HIST_MAX = 50; // 1問あたり残す回答数（文書の上限 256 KiB に収める）
       let remote = null; // 自分の記録のコレクション
       let timer = null,
-        flushing = false;
+        flushing = false,
+        retried = false,
+        replaceNext = false; // 成績を消す・読み込むときは、アカウントの記録と合わせずに置き換える
       const lastSent = {}; // 文書ごとに最後に書いた JSON。変わった文書だけ書く
       const setSync = (t) => ($("#sync").textContent = t);
       function bodies() {
-        const b = { session: { session: store.session ?? null } };
+        // 選択中の Set（cur）は保存しない。文書はただの JSON にする
+        const session = store.session
+          ? JSON.parse(JSON.stringify({ ...store.session, cur: [] }))
+          : null;
+        const b = { session: { session } };
         for (const s of SETS) b["hist-" + s] = { hist: {} };
         for (const [id, h] of Object.entries(store.hist)) {
           const k = "hist-" + id.split("-")[0];
@@ -698,19 +704,42 @@
         if (flushing) return schedule();
         flushing = true;
         try {
-          for (const [k, b] of Object.entries(bodies())) {
+          const replace = replaceNext;
+          for (const [k, b0] of Object.entries(bodies())) {
+            let b = b0;
+            if (lastSent[k] === JSON.stringify(b)) continue;
+            // 別の端末で開いたままのページが書いた回答を消さないよう、書く前にアカウントの記録と合わせる
+            if (k.startsWith("hist-") && !replace) {
+              const cur = await remote.doc(k).get();
+              if (cur.exists) {
+                b = { hist: mergeHist(cur.data()?.hist || {}, b.hist) };
+                Object.assign(store.hist, b.hist);
+              }
+            }
             const j = JSON.stringify(b);
             if (lastSent[k] === j) continue;
             await remote.doc(k).set(b);
             lastSent[k] = j;
           }
+          if (replace) replaceNext = false;
+          retried = false;
+          try {
+            localStorage.setItem(KEY, JSON.stringify(store));
+          } catch {}
           setSync(
             "成績はあなたの claude.ai アカウントに保存されます（PC・スマホで共通、ほかの人には見えません）。",
           );
         } catch (e) {
           const code = e?.code;
-          if (code === "unavailable") schedule(3000 + Math.random() * 2000);
-          else {
+          if (code === "unavailable" && !retried) {
+            retried = true;
+            schedule(3000 + Math.random() * 2000);
+          } else if (code === "unavailable" || code === "resource_exhausted") {
+            // 一時的なもの。次に回答したときにまた書く
+            setSync(
+              "いまはアカウントに保存できませんでした。次に回答したときにもう一度保存します。",
+            );
+          } else {
             remote = null;
             setSync(
               code === "invalid_argument"
@@ -1009,6 +1038,7 @@
           ok = a.filter(([, x]) => x.ok).length;
         const wrongIds = a.filter(([, x]) => !x.ok).map(([id]) => id);
         if (S.temp) return show("stats");
+        S = null; // 終わった出題を「続きから」に戻さない
         delete store.session;
         save();
         const byCat = {};
@@ -1196,6 +1226,7 @@
               );
             if (!okShape) throw new Error("shape");
             store.hist = mergeHist({}, h);
+            replaceNext = true;
             save();
             renderStats();
           } catch {
@@ -1208,6 +1239,7 @@
         $("#reset").onclick = () => {
           if (confirm("成績をすべて消します。元に戻せません。")) {
             store = { hist: {} };
+            replaceNext = true;
             save();
             renderStats();
           }
